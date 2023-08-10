@@ -221,13 +221,11 @@ function worker(controllerAddr)
                         ip: process.env.SERVER_IP
                     });
                 });
-            }
-            if(data.command == `galera_new_cluster`){
+            } else if(data.command == `galera_new_cluster`){
                 exec(data.command, (error, stdout, stderr) => {
                     client.emit("data", {stdout: stdout});
                 });
-            }
-            else {
+            } else {
                 exec(data.command, (error, stdout, stderr) => {
                     if (error) {
                         client.emit("data", {error: error});
