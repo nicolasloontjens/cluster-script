@@ -6,14 +6,41 @@ let servers;
 let voteOptions = {};
 let votedServers = [];
 let voteInterval;
+let finishedServers = [];
+let finishedServersInterval;
 
 init();
 
-//script entrypoint
 function init()
 {
+    checkIfMariaDBIsRunning();
     calculateVariables();
     startVoteSocket();
+}
+
+//mariadb should not be running, it should be disabled on server startup
+//by using sytemctl disable mariadb, but if it is running, we stop it here if the env variable CAN_STOP_MARIADB is set to true
+function checkIfMariaDBIsRunning()
+{
+    exec('systemctl is-active mariadb', (error, stdout, stderr) => {
+        if (error) {
+            //command returns exit code 3: the process is not running
+            return;
+        }
+        if(process.env.CAN_STOP_MARIADB){
+            console.log("MariaDB is running, stopping it now");
+            exec('systemctl stop mariadb', (error, stdout, stderr) => {
+                if (error) {
+                    console.log(error);
+                    return;
+                }
+                console.log("MariaDB stopped");
+            });
+        } else {
+            console.log("MariaDB is running, please stop it before running this script");
+            process.exit(1);
+        }
+    });
 }
 
 //looks in the env file for all server ips the cluster has and creates an object with the ips as keys and the votes as values
@@ -53,6 +80,7 @@ function startVoteSocket()
         });
     });
     watchVotedServers();
+    console.log("voting process started, waiting for all servers to vote");
 }
 
 //checks if all servers have voted and if so, picks the winner
@@ -75,7 +103,7 @@ function watchVotedServers(){
 //Here we ask all the other servers to identify themselves and then request their grastates
 function controller()
 {
-    console.log('starting as controller');
+    console.log('starting as controller server');
     const srv = new Server(process.env.COMMAND_PORT);  
     let workers = []; 
     srv.on("connection", (socket) => {
@@ -164,23 +192,32 @@ function compareGrastates(workers, states)
 }
 //Here we start the Galera cluster on the server that is safe to bootstrap
 //We also start the mariadb process on all the other servers, allowing them to join the cluster
-function startCluster(safeServer, workers)
+async function startCluster(safeServer, workers)
 {
     if(safeServer.ip === process.env.SERVER_IP){
         exec(`galera_new_cluster`, (error, stdout, stderr) => {
+            console.log("starting galera cluster on this server");
             if (error) {
                 console.log(error);
             }
+            finishedServers.push(safeServer.ip);
             workers.forEach((worker) => {
+                console.log("starting mariadb on " + worker.ip);
                 worker.socket.emit("command", {command: `systemctl start mariadb`});
+                worker.socket.on("finished", (data) => {
+                    finishedServers.push(worker.ip);
+                });
             });
         });
     } else {
+        //if the safeServer is not the controller server, we send the command to the safeServer and wait for it to finish
         let safeWorker = workers.filter((worker) => {
             return worker.ip === safeServer.ip
         })[0];
         safeWorker.socket.emit("command", {command: `galera_new_cluster`})
         safeWorker.socket.on("data", (data) => {
+            console.log("starting galera cluster on " + safeServer.ip);
+            finishedServers.push(safeServer.ip);
             exec(`systemctl start mariadb`, (error, stdout, stderr) => {
                 if (error) {
                     console.log(error);
@@ -191,15 +228,30 @@ function startCluster(safeServer, workers)
             });
             otherWorkers.forEach((worker) => {
                 worker.socket.emit("command", {command: `systemctl start mariadb`});
+                worker.socket.on("finished", (data) => {
+                    finishedServers.push(worker.ip);
+                });
             });
         });
     }
-    workers.forEach((worker) => {
-        worker.socket.emit("exit");
-    });
-    console.log('cluster started');
-    process.exit(0);
+    watchClusterServers(workers);
 }
+
+//This is used to check if all the servers have finished starting the mariadb process, if so, we exit the script
+function watchClusterServers(workers)
+{
+    finishedServersInterval = setInterval(() => {
+        if(finishedServers.length === servers.length){
+            clearInterval(finishedServersInterval);
+            console.log("all servers finished, cluster should be running");
+            workers.forEach((worker) => {
+                worker.socket.emit("exit");
+            });
+            process.exit(0);
+        }
+    }, 1000);
+}
+
 //This is used on the servers that lost the voting round, they send information to the controller
 function worker(controllerAddr)
 {
@@ -210,29 +262,40 @@ function worker(controllerAddr)
         });
         client.on("command", (data) => {
             console.log(`executing command:  ${data.command}`)
-            if(data.command == `cat ${process.env.GRASTATE_LOCATION}`){
-                exec(data.command, (error, stdout, stderr) => {
-                    if (error) {
-                        client.emit("data", {error: error});
-                        return;
-                    }
-                    client.emit("data", {
-                        grastate: stdout.replace(" ", "").split("\n"), 
-                        ip: process.env.SERVER_IP
+            switch (data.command){
+                case `cat ${process.env.GRASTATE_LOCATION}`:
+                    exec(data.command, (error, stdout, stderr) => {
+                        if (error) {
+                            client.emit("data", {error: error});
+                            return;
+                        }
+                        client.emit("data", {
+                            grastate: stdout.replace(" ", "").split("\n"), 
+                            ip: process.env.SERVER_IP
+                        });
                     });
-                });
-            } else if(data.command == `galera_new_cluster`){
-                exec(data.command, (error, stdout, stderr) => {
-                    client.emit("data", {stdout: stdout});
-                });
-            } else {
-                exec(data.command, (error, stdout, stderr) => {
-                    if (error) {
-                        client.emit("data", {error: error});
+                    break;
+                case 'galera_new_cluster':
+                    exec(data.command, (error, stdout, stderr) => {
+                        client.emit("data", {stdout: stdout});
                         return;
-                    }
-                    client.emit("data", {stdout: stdout});
-                });
+                    });
+                    break;
+                case 'systemctl start mariadb':
+                    exec(data.command, (error, stdout, stderr) => {
+                        client.emit("finished", {stdout: stdout});
+                        return;
+                    });
+                    break;
+                default:
+                    exec(data.command, (error, stdout, stderr) => {
+                        if (error) {
+                            client.emit("data", {error: error});
+                            return;
+                        }
+                        client.emit("data", {stdout: stdout});
+                    });
+                    break;
             }
         });
         client.on('exit', () => {
