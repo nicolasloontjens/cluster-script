@@ -11,33 +11,31 @@ let finishedServersInterval;
 
 init();
 
-async function init()
+function init()
 {
-    await checkIfMariaDBIsRunning();
     calculateVariables();
-    startVoteSocket();
+    checkIfMariaDBIsRunning();
 }
 
 //mariadb should not be running, it should be disabled on server startup
 //by using sytemctl disable mariadb, but if it is running, we stop it here if the env variable CAN_STOP_MARIADB is set to true
-async function checkIfMariaDBIsRunning()
+function checkIfMariaDBIsRunning()
 {
     exec('systemctl is-active mariadb', (error, stdout, stderr) => {
         if (error) {
             //command returns exit code 3: the process is not running
+            startVoteSocket();
             return;
         }
         if(process.env.CAN_STOP_MARIADB){
             console.log("MariaDB is running, stopping it now");
-            return new Promise((resolve, reject) => {
-                exec('systemctl stop mariadb', (error, stdout, stderr) => {
-                    if (error) {
-                        console.log(error);
-                        return;
-                    }
-                    console.log("MariaDB stopped");
-                    resolve();
-                });
+            exec('systemctl stop mariadb', (error, stdout, stderr) => {
+                if (error) {
+                    console.log(error);
+                    return;
+                }
+                console.log("MariaDB stopped");
+                startVoteSocket();
             });
         } else {
             console.log("MariaDB is running, please stop it before running this script");
