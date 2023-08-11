@@ -11,16 +11,16 @@ let finishedServersInterval;
 
 init();
 
-function init()
+async function init()
 {
-    checkIfMariaDBIsRunning();
+    await checkIfMariaDBIsRunning();
     calculateVariables();
     startVoteSocket();
 }
 
 //mariadb should not be running, it should be disabled on server startup
 //by using sytemctl disable mariadb, but if it is running, we stop it here if the env variable CAN_STOP_MARIADB is set to true
-function checkIfMariaDBIsRunning()
+async function checkIfMariaDBIsRunning()
 {
     exec('systemctl is-active mariadb', (error, stdout, stderr) => {
         if (error) {
@@ -29,12 +29,15 @@ function checkIfMariaDBIsRunning()
         }
         if(process.env.CAN_STOP_MARIADB){
             console.log("MariaDB is running, stopping it now");
-            exec('systemctl stop mariadb', (error, stdout, stderr) => {
-                if (error) {
-                    console.log(error);
-                    return;
-                }
-                console.log("MariaDB stopped");
+            return new Promise((resolve, reject) => {
+                exec('systemctl stop mariadb', (error, stdout, stderr) => {
+                    if (error) {
+                        console.log(error);
+                        return;
+                    }
+                    console.log("MariaDB stopped");
+                    resolve();
+                });
             });
         } else {
             console.log("MariaDB is running, please stop it before running this script");
@@ -174,13 +177,33 @@ function compareGrastates(workers, states)
         if(parsedStates.every(server => server.seqno === -1)){
             //no good startup order on the cluster so
             //start the cluster on the "controller" node, followed by the other nodes
-            exec('galera_recovery', (error, stdout, stderr) => {
-                if (error) {
+            console.log("no good startup order found, starting cluster recovery on this node");
+            exec(`sed -i 's/safe_to_bootstrap: 0/safe_to_bootstrap: 1/' /var/lib/mysql/grastate.dat`, (error, stdout, stderr) => {
+                if(error){
                     console.log(error);
                     return;
                 }
-                workers.forEach((worker) => {
-                    worker.socket.emit("command", {command: `systemctl start mariadb`});
+                exec('galera_recovery', (error, stdout, stderr) => {
+                    if (error) {
+                        console.log(error);
+                        return;
+                    }
+                    exec('galera_new_cluster', (error, stdout, stderr) => {
+                        if (error) {
+                            console.log(error);
+                            return;
+                        }
+                        finishedServers.push(process.env.SERVER_IP);
+                        console.log("cluster recovery finished on this node");
+                        workers.forEach((worker) => {
+                            console.log("starting mariadb on " + worker.ip);
+                            worker.socket.emit("command", {command: `systemctl start mariadb`});
+                            worker.socket.on("finished", (data) => {
+                                finishedServers.push(worker.ip);
+                            });
+                        });
+                        watchClusterServers(workers);
+                    });
                 });
             });
         } else {
@@ -200,7 +223,7 @@ async function startCluster(safeServer, workers)
             if (error) {
                 console.log(error);
             }
-            finishedServers.push(safeServer.ip);
+            finishedServers.push(process.env.SERVER_IP);
             workers.forEach((worker) => {
                 console.log("starting mariadb on " + worker.ip);
                 worker.socket.emit("command", {command: `systemctl start mariadb`});
@@ -214,22 +237,25 @@ async function startCluster(safeServer, workers)
         let safeWorker = workers.filter((worker) => {
             return worker.ip === safeServer.ip
         })[0];
+        console.log("starting galera cluster on " + safeServer.ip);
         safeWorker.socket.emit("command", {command: `galera_new_cluster`})
         safeWorker.socket.on("data", (data) => {
-            console.log("starting galera cluster on " + safeServer.ip);
             finishedServers.push(safeServer.ip);
+            console.log("starting mariadb on this server");
             exec(`systemctl start mariadb`, (error, stdout, stderr) => {
                 if (error) {
                     console.log(error);
                 }
-            });
-            let otherWorkers = workers.filter((worker) => {
-                return worker.ip !== safeServer.ip
-            });
-            otherWorkers.forEach((worker) => {
-                worker.socket.emit("command", {command: `systemctl start mariadb`});
-                worker.socket.on("finished", (data) => {
-                    finishedServers.push(worker.ip);
+                finishedServers.push(process.env.SERVER_IP);
+                let otherWorkers = workers.filter((worker) => {
+                    return worker.ip !== safeServer.ip
+                });
+                otherWorkers.forEach((worker) => {
+                    console.log("starting mariadb on " + worker.ip);
+                    worker.socket.emit("command", {command: `systemctl start mariadb`});
+                    worker.socket.on("finished", (data) => {
+                        finishedServers.push(worker.ip);
+                    });
                 });
             });
         });
