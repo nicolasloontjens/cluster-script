@@ -8,6 +8,9 @@ let votedServers = [];
 let voteInterval;
 let finishedServers = [];
 let finishedServersInterval;
+let pending = true;
+let timeoutInterval;
+/*eslint no-undef:*/
 
 init();
 
@@ -21,7 +24,7 @@ function init()
 //by using sytemctl disable mariadb, but if it is running, we stop it here if the env variable CAN_STOP_MARIADB is set to true
 function checkIfMariaDBIsRunning()
 {
-    exec('systemctl is-active mariadb', (error, stdout, stderr) => {
+    exec('sudo systemctl is-active mariadb', (error) => {
         if (error) {
             //command returns exit code 3: the process is not running
             startVoteSocket();
@@ -29,7 +32,7 @@ function checkIfMariaDBIsRunning()
         }
         if(process.env.CAN_STOP_MARIADB){
             console.log("MariaDB is running, stopping it now");
-            exec('systemctl stop mariadb', (error, stdout, stderr) => {
+            exec('sudo systemctl stop mariadb', (error) => {
                 if (error) {
                     console.log(error);
                     return;
@@ -65,7 +68,7 @@ function startVoteSocket()
     const srv = new Server(process.env.VOTE_PORT);
     srv.on("connection", (socket) => {
         srv.emit("vote", {vote: vote, server: process.env.SERVER_IP});
-        socket.on("winner", (data) => {
+        socket.on("winner", () => {
             socket.disconnect();
             controller();
         });
@@ -81,15 +84,19 @@ function startVoteSocket()
         });
     });
     watchVotedServers();
+    startTimeoutInterval();
     console.log("voting process started, waiting for all servers to vote");
 }
 
 //checks if all servers have voted and if so, picks the winner
 function watchVotedServers(){
     voteInterval = setInterval(() => {
+        pending = true;
         if(votedServers.length === servers.length - 1){
+            pending = false;
+            clearInterval(timeoutInterval);
             clearInterval(voteInterval);
-            winner = Object.keys(voteOptions).reduce((a, b) => voteOptions[a].votes > voteOptions[b].votes ? a : b);
+            let winner = Object.keys(voteOptions).reduce((a, b) => voteOptions[a].votes > voteOptions[b].votes ? a : b);
             if(winner !== process.env.SERVER_IP){
                 worker(winner);
             } else {
@@ -122,7 +129,7 @@ function controller()
 function requestGrastates(workers)
 {
     let states = []
-    exec(`cat ${process.env.GRASTATE_LOCATION}`, (error, stdout, stderr) => {
+    exec(`sudo cat ${process.env.GRASTATE_LOCATION}`, (error, stdout) => {
         if (error) {
             console.log(error);
             return;
@@ -132,7 +139,7 @@ function requestGrastates(workers)
             ip: process.env.SERVER_IP
         })
         workers.forEach((worker) => {
-            worker.socket.emit("command", {command: `cat ${process.env.GRASTATE_LOCATION}`});
+            worker.socket.emit("command", {command: `sudo cat ${process.env.GRASTATE_LOCATION}`});
             worker.socket.on("data", (data) => {
                 states.push(data)
                 if(states.length === servers.length){
@@ -176,32 +183,26 @@ function compareGrastates(workers, states)
             //no good startup order on the cluster so
             //start the cluster on the "controller" node, followed by the other nodes
             console.log("no good startup order found, starting cluster recovery on this node");
-            exec(`sed -i 's/safe_to_bootstrap: 0/safe_to_bootstrap: 1/' /var/lib/mysql/grastate.dat`, (error, stdout, stderr) => {
+            exec(`sudo sed -i 's/safe_to_bootstrap: 0/safe_to_bootstrap: 1/' /var/lib/mysql/grastate.dat`, (error) => {
                 if(error){
                     console.log(error);
                     return;
                 }
-                exec('galera_recovery', (error, stdout, stderr) => {
+                exec('sudo galera_new_cluster', (error) => {
                     if (error) {
                         console.log(error);
                         return;
                     }
-                    exec('galera_new_cluster', (error, stdout, stderr) => {
-                        if (error) {
-                            console.log(error);
-                            return;
-                        }
-                        finishedServers.push(process.env.SERVER_IP);
-                        console.log("cluster recovery finished on this node");
-                        workers.forEach((worker) => {
-                            console.log("starting mariadb on " + worker.ip);
-                            worker.socket.emit("command", {command: `systemctl start mariadb`});
-                            worker.socket.on("finished", (data) => {
-                                finishedServers.push(worker.ip);
-                            });
+                    finishedServers.push(process.env.SERVER_IP);
+                    console.log("cluster recovery finished on this node");
+                    workers.forEach((worker) => {
+                        console.log("starting mariadb on " + worker.ip);
+                        worker.socket.emit("command", {command: `sudo systemctl start mariadb`});
+                        worker.socket.on("finished", () => {
+                            finishedServers.push(worker.ip);
                         });
-                        watchClusterServers(workers);
                     });
+                    watchClusterServers(workers);
                 });
             });
         } else {
@@ -216,7 +217,7 @@ function compareGrastates(workers, states)
 async function startCluster(safeServer, workers)
 {
     if(safeServer.ip === process.env.SERVER_IP){
-        exec(`galera_new_cluster`, (error, stdout, stderr) => {
+        exec(`sudo galera_new_cluster`, (error) => {
             console.log("starting galera cluster on this server");
             if (error) {
                 console.log(error);
@@ -224,8 +225,8 @@ async function startCluster(safeServer, workers)
             finishedServers.push(process.env.SERVER_IP);
             workers.forEach((worker) => {
                 console.log("starting mariadb on " + worker.ip);
-                worker.socket.emit("command", {command: `systemctl start mariadb`});
-                worker.socket.on("finished", (data) => {
+                worker.socket.emit("command", {command: `sudo systemctl start mariadb`});
+                worker.socket.on("finished", () => {
                     finishedServers.push(worker.ip);
                 });
             });
@@ -236,11 +237,11 @@ async function startCluster(safeServer, workers)
             return worker.ip === safeServer.ip
         })[0];
         console.log("starting galera cluster on " + safeServer.ip);
-        safeWorker.socket.emit("command", {command: `galera_new_cluster`})
-        safeWorker.socket.on("data", (data) => {
+        safeWorker.socket.emit("command", {command: `sudo galera_new_cluster`})
+        safeWorker.socket.on("data", () => {
             finishedServers.push(safeServer.ip);
             console.log("starting mariadb on this server");
-            exec(`systemctl start mariadb`, (error, stdout, stderr) => {
+            exec(`sudo systemctl start mariadb`, (error) => {
                 if (error) {
                     console.log(error);
                 }
@@ -250,8 +251,8 @@ async function startCluster(safeServer, workers)
                 });
                 otherWorkers.forEach((worker) => {
                     console.log("starting mariadb on " + worker.ip);
-                    worker.socket.emit("command", {command: `systemctl start mariadb`});
-                    worker.socket.on("finished", (data) => {
+                    worker.socket.emit("command", {command: `sudo systemctl start mariadb`});
+                    worker.socket.on("finished", () => {
                         finishedServers.push(worker.ip);
                     });
                 });
@@ -287,8 +288,8 @@ function worker(controllerAddr)
         client.on("command", (data) => {
             console.log(`executing command:  ${data.command}`)
             switch (data.command){
-                case `cat ${process.env.GRASTATE_LOCATION}`:
-                    exec(data.command, (error, stdout, stderr) => {
+                case `sudo cat ${process.env.GRASTATE_LOCATION}`:
+                    exec(data.command, (error, stdout) => {
                         if (error) {
                             client.emit("data", {error: error});
                             return;
@@ -299,20 +300,20 @@ function worker(controllerAddr)
                         });
                     });
                     break;
-                case 'galera_new_cluster':
-                    exec(data.command, (error, stdout, stderr) => {
+                case 'sudo galera_new_cluster':
+                    exec(data.command, (error, stdout) => {
                         client.emit("data", {stdout: stdout});
                         return;
                     });
                     break;
-                case 'systemctl start mariadb':
-                    exec(data.command, (error, stdout, stderr) => {
+                case 'sudo systemctl start mariadb':
+                    exec(data.command, (error, stdout) => {
                         client.emit("finished", {stdout: stdout});
                         return;
                     });
                     break;
                 default:
-                    exec(data.command, (error, stdout, stderr) => {
+                    exec(data.command, (error, stdout) => {
                         if (error) {
                             client.emit("data", {error: error});
                             return;
@@ -326,4 +327,23 @@ function worker(controllerAddr)
             process.exit(0);
         });
     });
+}
+
+//if the voting process takes too long, we start mariadb cluster on this server, 
+//this is probably because only this server went down and the cluster is running with 2 instances
+function startTimeoutInterval()
+{
+    timeoutInterval = setInterval(() => {
+        if(pending){
+            clearInterval(timeoutInterval);
+            clearInterval(voteInterval);
+            console.log("timeout, starting cluster recovery on this node");
+            exec(`sudo systemctl start mariadb`, (error) => {
+                if (error) {
+                    console.log(error);
+                }
+                process.exit(0);
+            });
+        }
+    }, 120000);
 }

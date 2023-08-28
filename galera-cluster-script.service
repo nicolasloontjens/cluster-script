@@ -1,0 +1,9 @@
+[Unit]
+Description=Galera cluster startup script
+
+[Service]
+WorkingDirectory=/home/ocular/cluster-script
+ExecStart=/home/ocular/.nvm/versions/node/v18.12.1/bin/node /home/ocular/cluster-script/index.js
+
+[Install]
+WantedBy=multi-user.target
